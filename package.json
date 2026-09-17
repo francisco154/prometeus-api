@@ -1,0 +1,9 @@
+{
+  "name": "prometeus-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "API de Prometeus: publica el pack de carátulas curadas en GitHub. Sin dependencias.",
+  "main": "server.js",
+  "scripts": { "start": "node server.js" },
+  "engines": { "node": ">=18" }
+}
