@@ -1,17 +1,24 @@
 /* Prometeus API — recibe el pack de carátulas del TV Master y lo publica
  * en GitHub (overrides.json público). Cero dependencias (solo Node 18+).
  *
- * Secrets (SOLO como Environment Variables en Render, jamás en código):
- *   GITHUB_TOKEN  token con permiso contents:write en DEST_REPO
- * Env comunes:
- *   ADMIN_CODE    código de 4 números + 2 letras que valida al Master
- *   DEST_REPO     "francisco154/prometeus-datos" (owner/repo)
- *   DEST_BRANCH   "main"
- *   DEST_PATH     "overrides.json"
- *   PORT          lo inyecta Render
+ * Auth GitHub (3.17, sin PAT): Render tiene como secret una SSH Deploy Key
+ * (lectura+escritura) del repo destino. git push usa esa llave por SSH
+ * (GIT_SSH_COMMAND). NINGÚN token vive en el servidor ni en el APK.
+ *
+ * Env:
+ *   ADMIN_CODE        código de 4 números + 2 letras que valida al Master
+ *   DEST_REPO         "francisco154/prometeus-datos" (owner/repo)
+ *   DEST_BRANCH       "main"
+ *   DEST_PATH         "overrides.json"
+ *   DEPLOY_KEY_B64    llave SSH privada (base64), montada SOLO en Render
+ *   PORT              lo inyecta Render
  */
 'use strict';
 const http = require('http');
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
+const { execFile } = require('child_process');
 
 const ADMIN_CODE = process.env.ADMIN_CODE || '';
 const DEST_REPO = process.env.DEST_REPO || 'francisco154/prometeus-datos';
@@ -39,22 +46,42 @@ function leerBody(req) {
   });
 }
 
-async function gh(path, opts = {}) {
-  // El token vive SOLO en env; jamás se loguea ni se devuelve.
-  const token = process.env.GITHUB_TOKEN || '';
-  const r = await fetch(`https://api.github.com${path}`, {
-    ...opts,
-    headers: {
-      Accept: 'application/vnd.github+json',
-      'User-Agent': 'prometeus-api',
-      Authorization: `token ${token}`,
-      ...(opts.headers || {}),
-    },
+function sh(file, args, opts = {}) {
+  return new Promise((resolve, reject) => {
+    execFile(file, args, { timeout: 25000, ...opts }, (err, stdout, stderr) => {
+      if (err) {
+        err.stdout = stdout;
+        err.stderr = stderr;
+        return reject(err);
+      }
+      resolve({ stdout, stderr });
+    });
   });
-  const txt = await r.text();
-  let json = null;
-  try { json = JSON.parse(txt); } catch { /* puede venir vacío */ }
-  return { status: r.status, json, txt };
+}
+
+/* Llave SSH a archivo temporal con el GIT_SSH_COMMAND ya armado.
+ * Retorna {keyPath, env} o lanza si falta el secret. */
+function sshEnv() {
+  const b64 = process.env.DEPLOY_KEY_B64 || '';
+  if (!b64) throw new Error('sin llave de despliegue configurada');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'promkey-'));
+  const keyPath = path.join(dir, 'id_ed25519');
+  fs.writeFileSync(keyPath, Buffer.from(b64, 'base64'), { mode: 0o600 });
+  return {
+    keyPath,
+    env: {
+      ...process.env,
+      GIT_SSH_COMMAND: `ssh -i ${keyPath} -o StrictHostKeyChecking=no -o IdentitiesOnly=yes`,
+      GIT_AUTHOR_NAME: 'prometeus-api',
+      GIT_AUTHOR_EMAIL: 'prometeus-api@local',
+      GIT_COMMITTER_NAME: 'prometeus-api',
+      GIT_COMMITTER_EMAIL: 'prometeus-api@local',
+    },
+  };
+}
+
+function limpiar(dir) {
+  try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ }
 }
 
 function validarPack(pack) {
@@ -78,6 +105,52 @@ function validarPack(pack) {
   return null;
 }
 
+/* Publica vía git push con la deploy key: clona shallow, pisa el archivo,
+ * commit y push. Devuelve {version, count}. */
+async function publicarGit(posters) {
+  const { keyPath, env } = sshEnv();
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), 'prompub-'));
+  try {
+    await sh('git', [
+      'clone', '--depth', '1', '--branch', DEST_BRANCH,
+      `git@github.com:${DEST_REPO}.git`, work,
+    ], { env });
+    const destino = path.join(work, DEST_PATH);
+    let version = 4;
+    try {
+      const actual = JSON.parse(fs.readFileSync(destino, 'utf8'));
+      version = (Number(actual.version) || 3) + 1;
+    } catch { /* arranca en 4 */ }
+    const contenido = {
+      version,
+      updated_at: new Date().toISOString().slice(0, 10),
+      posters,
+    };
+    fs.mkdirSync(path.dirname(destino), { recursive: true });
+    fs.writeFileSync(destino, JSON.stringify(contenido));
+    await sh('git', ['-C', work, 'add', DEST_PATH], { env });
+    let hayCambios = true;
+    try {
+      await sh('git', ['-C', work, 'diff', '--cached', '--quiet'], { env });
+      hayCambios = false;
+    } catch { hayCambios = true; }
+    if (hayCambios) {
+      await sh('git', ['-C', work, 'commit', '-m', `Pack v${version} desde Prometeus API`], { env });
+      await sh('git', ['-C', work, 'push', 'origin', DEST_BRANCH], { env });
+    } else {
+      // sin cambios de contenido igual se informa la versión vigente
+      try {
+        const actual = JSON.parse(fs.readFileSync(destino, 'utf8'));
+        version = Number(actual.version) || version;
+      } catch { /* usa la calculada */ }
+    }
+    return { version, count: Object.keys(posters).length };
+  } finally {
+    limpiar(work);
+    limpiar(path.dirname(keyPath));
+  }
+}
+
 async function manejarPublish(req, res) {
   let body;
   try {
@@ -91,46 +164,11 @@ async function manejarPublish(req, res) {
   }
   const err = validarPack(body.posters);
   if (err) return send(res, 400, { ok: false, error: err });
-  if (!process.env.GITHUB_TOKEN) {
-    return send(res, 500, { ok: false, error: 'backend sin token configurado' });
-  }
   try {
-    // sha actual para pisar el archivo
-    const cur = await gh(
-      `/repos/${DEST_REPO}/contents/${DEST_PATH}?ref=${DEST_BRANCH}`
-    );
-    const sha = cur.json && cur.json.sha ? cur.json.sha : undefined;
-    let actual = { version: 3, posters: {} };
-    if (cur.json && cur.json.content) {
-      try {
-        actual = JSON.parse(Buffer.from(cur.json.content, 'base64').toString('utf8'));
-      } catch { /* arranca limpio */ }
-    }
-    const version = (Number(actual.version) || 3) + 1;
-    const contenido = {
-      version,
-      updated_at: new Date().toISOString().slice(0, 10),
-      posters: body.posters,
-    };
-    const put = await gh(`/repos/${DEST_REPO}/contents/${DEST_PATH}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        message: `Pack v${version} desde Prometeus API`,
-        content: Buffer.from(JSON.stringify(contenido)).toString('base64'),
-        branch: DEST_BRANCH,
-        ...(sha ? { sha } : {}),
-      }),
-    });
-    if (put.status !== 200 && put.status !== 201) {
-      return send(res, 502, { ok: false, error: 'GitHub no aceptó el archivo' });
-    }
-    return send(res, 200, {
-      ok: true,
-      version,
-      count: Object.keys(body.posters).length,
-    });
+    const r = await publicarGit(body.posters);
+    return send(res, 200, { ok: true, version: r.version, count: r.count });
   } catch {
+    // jamás se expone el motivo interno (podría rozar secretos)
     return send(res, 500, { ok: false, error: 'error interno publicando' });
   }
 }
