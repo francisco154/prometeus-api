@@ -107,7 +107,45 @@ function validarPack(pack) {
 
 /* Publica vía git push con la deploy key: clona shallow, pisa el archivo,
  * commit y push. Devuelve {version, count}. */
-async function publicarGit(posters) {
+async function publicarGit(posters, fixesSolo) {
+  // 3.18.2: si solo vienen fixes, se mezclan sin tocar posters
+  if (fixesSolo) {
+    const { keyPath, env } = sshEnv();
+    const work = fs.mkdtempSync(path.join(os.tmpdir(), 'promfix-'));
+    try {
+      await sh('git', [
+        'clone', '--depth', '1', '--branch', DEST_BRANCH,
+        `git@github.com:${DEST_REPO}.git`, work,
+      ], { env });
+      const destino = path.join(work, DEST_PATH);
+      const actual = JSON.parse(fs.readFileSync(destino, 'utf8'));
+      const merged = { ...(actual.fixes || {}), ...fixesSolo };
+      // filtra las que ya tengan manual (el manual siempre gana)
+      for (const g of Object.keys(merged)) {
+        if (actual.posters && actual.posters[g]) delete merged[g];
+      }
+      actual.fixes = merged;
+      fs.writeFileSync(destino, JSON.stringify(actual));
+      await sh('git', ['-C', work, 'add', DEST_PATH], { env });
+      let hayCambios = true;
+      try {
+        await sh('git', ['-C', work, 'diff', '--cached', '--quiet'], { env });
+        hayCambios = false;
+      } catch { hayCambios = true; }
+      let version = Number(actual.version) || 0;
+      if (hayCambios) {
+        version += 1;
+        actual.version = version;
+        fs.writeFileSync(destino, JSON.stringify(actual));
+        await sh('git', ['-C', work, 'commit', '-m', `Fixes colaborativos v${version}`], { env });
+        await sh('git', ['-C', work, 'push', 'origin', DEST_BRANCH], { env });
+      }
+      return { version, count: Object.keys(actual.posters || {}).length };
+    } finally {
+      limpiar(work);
+      limpiar(path.dirname(keyPath));
+    }
+  }
   const { keyPath, env } = sshEnv();
   const work = fs.mkdtempSync(path.join(os.tmpdir(), 'prompub-'));
   try {
@@ -170,8 +208,9 @@ async function manejarPublish(req, res) {
   if (!CODE_RE.test(code) || code !== ADMIN_CODE || !ADMIN_CODE) {
     return send(res, 403, { ok: false, error: 'código de administrador inválido' });
   }
+  const tieneFixes = body.fixes && typeof body.fixes === 'object' && Object.keys(body.fixes).length > 0;
   const err = validarPack(body.posters);
-  if (err) return send(res, 400, { ok: false, error: err });
+  if (err && !tieneFixes) return send(res, 400, { ok: false, error: err });
   const fixes = {};
   if (body.fixes && typeof body.fixes === 'object' && !Array.isArray(body.fixes)) {
     for (const [g, u] of Object.entries(body.fixes)) {
@@ -183,7 +222,7 @@ async function manejarPublish(req, res) {
     }
   }
   try {
-    const r = await publicarGit(body.posters);
+    const r = await publicarGit(body.posters || {}, tieneFixes ? fixes : null);
     return send(res, 200, { ok: true, version: r.version, count: r.count });
   } catch {
     // jamás se expone el motivo interno (podría rozar secretos)
