@@ -121,10 +121,18 @@ async function publicarGit(posters) {
       const actual = JSON.parse(fs.readFileSync(destino, 'utf8'));
       version = (Number(actual.version) || 3) + 1;
     } catch { /* arranca en 4 */ }
+    // 3.18.2: mezcla fixes colaborativos (TMDB) con el pack, sin pisar manuales
+    let prevFixes = {};
+    try {
+      const actual = JSON.parse(fs.readFileSync(destino, 'utf8'));
+      if (actual.fixes && typeof actual.fixes === 'object') prevFixes = actual.fixes;
+    } catch { /* arranca limpio */ }
+    const mergedFixes = { ...prevFixes, ...fixes };
     const contenido = {
       version,
       updated_at: new Date().toISOString().slice(0, 10),
       posters,
+      fixes: mergedFixes,
     };
     fs.mkdirSync(path.dirname(destino), { recursive: true });
     fs.writeFileSync(destino, JSON.stringify(contenido));
@@ -164,6 +172,16 @@ async function manejarPublish(req, res) {
   }
   const err = validarPack(body.posters);
   if (err) return send(res, 400, { ok: false, error: err });
+  const fixes = {};
+  if (body.fixes && typeof body.fixes === 'object' && !Array.isArray(body.fixes)) {
+    for (const [g, u] of Object.entries(body.fixes)) {
+      if (typeof g === 'string' && g.length >= 8 && typeof u === 'string' &&
+          (u.startsWith('http://') || u.startsWith('https://')) && u.length <= 2000 &&
+          Object.keys(fixes).length < 500) {
+        fixes[g] = u;
+      }
+    }
+  }
   try {
     const r = await publicarGit(body.posters);
     return send(res, 200, { ok: true, version: r.version, count: r.count });
